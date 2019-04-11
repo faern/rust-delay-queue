@@ -1,8 +1,15 @@
 use std::collections::BinaryHeap;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use std::cmp::Ordering;
 use delayed::Delayed;
+use std::thread;
+
+fn log(msg: &str) {
+    let tid = thread::current().id();
+    eprintln!("{:?}:{}", tid, msg);
+}
 
 /// A concurrent unbounded blocking queue where each item can only be removed when its delay
 /// expires.
@@ -112,7 +119,7 @@ impl<T: Delayed> DelayQueue<T> {
     /// queue.push(Delay::for_duration("2nd", Duration::from_secs(5)));
     /// ```
     pub fn push(&mut self, item: T) {
-        let mut queue = self.shared_data.queue.lock().unwrap();
+        let mut queue = self.shared_data.queue.lock();
 
         {
             // If the new item goes to the head of the queue then notify consumers
@@ -120,7 +127,10 @@ impl<T: Delayed> DelayQueue<T> {
             if (cur_head == None)
                 || (item.delayed_until() < cur_head.unwrap().delayed.delayed_until())
             {
-                self.shared_data.condvar_new_head.notify_one();
+                let woken = self.shared_data.condvar_new_head.notify_one();
+                log(&format!("push: notify_one({:p}): {}", &self.shared_data.condvar_new_head, woken));
+            } else {
+                log("push: Not notifying");
             }
         }
 
@@ -151,7 +161,7 @@ impl<T: Delayed> DelayQueue<T> {
     /// println!("Second pop: {}", queue.pop().value);
     /// ```
     pub fn pop(&mut self) -> T {
-        let mut queue = self.shared_data.queue.lock().unwrap();
+        let mut queue = self.shared_data.queue.lock();
 
         // Loop until an element can be popped, waiting if necessary
         loop {
@@ -161,6 +171,7 @@ impl<T: Delayed> DelayQueue<T> {
                     // If there is an element and its delay is expired
                     // break out of the loop to pop it
                     if elem.delayed.delayed_until() <= now {
+                        log("pop: Breaking loop, delay matched");
                         break;
                     }
                     // Otherwise, calculate the Duration until the element expires
@@ -173,15 +184,16 @@ impl<T: Delayed> DelayQueue<T> {
 
             // Wait until there is a new head of the queue
             // or the time to pop the current head expires
-            queue = if wait_duration > Duration::from_secs(0) {
+            if wait_duration > Duration::from_secs(0) {
+                log(&format!("pop: condvar wait_for({:p}) {}ms", &self.shared_data.condvar_new_head, wait_duration.as_millis()));
                 self.shared_data
                     .condvar_new_head
-                    .wait_timeout(queue, wait_duration)
-                    .unwrap()
-                    .0
+                    .wait_for(&mut queue, wait_duration);
             } else {
-                self.shared_data.condvar_new_head.wait(queue).unwrap()
-            };
+                log(&format!("pop: condvar wait({:p}) indefinite", &self.shared_data.condvar_new_head));
+                self.shared_data.condvar_new_head.wait(&mut queue);
+            }
+            log("pop: condvar wakeup");
         }
 
         self.force_pop(queue)
@@ -243,7 +255,7 @@ impl<T: Delayed> DelayQueue<T> {
     ///               .unwrap().value); // Prints "1st"
     /// ```
     pub fn try_pop_until(&mut self, try_until: Instant) -> Option<T> {
-        let mut queue = self.shared_data.queue.lock().unwrap();
+        let mut queue = self.shared_data.queue.lock();
 
         // Loop until an element can be popped or the timeout expires, waiting if necessary
         loop {
@@ -278,11 +290,7 @@ impl<T: Delayed> DelayQueue<T> {
             // Wait until there is a new head of the queue,
             // the time to pop the current head expires,
             // or the timeout expires
-            queue = self.shared_data
-                .condvar_new_head
-                .wait_timeout(queue, wait_duration)
-                .unwrap()
-                .0
+            self.shared_data.condvar_new_head.wait_for(&mut queue, wait_duration);
         }
 
         Some(self.force_pop(queue))
@@ -308,7 +316,7 @@ impl<T: Delayed> DelayQueue<T> {
     /// assert!(queue.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        let queue = self.shared_data.queue.lock().unwrap();
+        let queue = self.shared_data.queue.lock();
         queue.is_empty()
     }
 
@@ -320,7 +328,10 @@ impl<T: Delayed> DelayQueue<T> {
     /// Panics if `queue` is empty.
     fn force_pop(&self, mut queue: MutexGuard<BinaryHeap<Entry<T>>>) -> T {
         if queue.len() > 1 {
-            self.shared_data.condvar_new_head.notify_one();
+            let woken = self.shared_data.condvar_new_head.notify_one();
+            log(&format!("force_pop: notify_one({:p}): {}", &self.shared_data.condvar_new_head, woken));
+        } else {
+            log("force_pop: not notifying condvar");
         }
 
         queue.pop().unwrap().delayed
@@ -416,6 +427,7 @@ impl<T: Delayed> Eq for Entry<T> {}
 
 #[cfg(test)]
 mod tests {
+    use super::log;
     extern crate timebomb;
 
     use self::timebomb::timeout_ms;
@@ -550,21 +562,27 @@ mod tests {
                 let mut queue: DelayQueue<Delay<&str>> = DelayQueue::new();
                 let mut handles = vec![];
 
-                for _ in 0..3 {
+                for i in 0..3 {
                     let mut queue = queue.clone();
                     let handle = thread::spawn(move || {
+                        log(&format!("test: thread {} popping...", i));
                         let val = queue.pop().value;
+                        log(&format!("test: Popped {:?}", val));
                         if val == "3rd" {
                             assert!(queue.is_empty());
                         }
+                        log("test: Thread exit");
                     });
                     handles.push(handle);
                 }
 
                 thread::sleep(Duration::from_millis(100));
                 queue.push(Delay::for_duration("1st", Duration::from_millis(10)));
+                log("test: Pushed 1st");
                 queue.push(Delay::for_duration("2nd", Duration::from_millis(20)));
+                log("test: Pushed 2nt");
                 queue.push(Delay::for_duration("3rd", Duration::from_millis(30)));
+                log("test: Pushed 3rd");
 
                 for handle in handles {
                     handle.join().unwrap();

@@ -14,6 +14,7 @@ travis-ci = { repository = "tbcardoso/rust-delay-queue" }
 appveyor = { repository = "tbcardoso/rust-delay-queue" }
 
 [dependencies]
+parking_lot = "0.7.1"
 
 [dev-dependencies]
 timebomb = "0.1.2"

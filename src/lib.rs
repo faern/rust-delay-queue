@@ -3,6 +3,8 @@
 
 #![warn(missing_docs)]
 
+extern crate parking_lot;
+
 mod delayed;
 mod delay_queue;
 
